@@ -58,17 +58,21 @@ int info_get (tosc_message *m, connectionT *conn) {
   return(0);
 }
 
-int bidirectional_set(tosc_message *message, connectionT *conn) {
+int ack(tosc_message *message, connectionT *conn) {
     char reply[] = "/ack";
-    bioscc_bidirectional = 1;
-printf ("SENDING REPLY\n");
     conn->send(conn, reply, 5);
+    return(0);
+}
+
+int bidirectional_set(tosc_message *message, connectionT *conn) {
+    bioscc_bidirectional = 1;
+    ack(message, conn);
 
     return(0);
 }
 
 bioscc_handlerT handlers[] = {
-    {"/ack", info_get, NULL},
+    {"/ack", ack, ack},
     {"/bidirectional", bidirectional_set, bidirectional_set},
 /*
     {"/status", status_get, NULL},
@@ -93,6 +97,14 @@ static void sigintHandler(int x) {
   keepRunning = false;
 }
 
+void send_error_message(connectionT *conn, char *text) {
+    char buffer[128];
+    int len;
+
+    len = tosc_writeMessage(buffer, sizeof(buffer), "/error", "s", text);
+    conn->send(conn, buffer, len);
+}
+
 void dispatch_message (tosc_message *osc, connectionT *conn) {
     bioscc_handlerT *h;
     int i = 0;
@@ -105,10 +117,10 @@ void dispatch_message (tosc_message *osc, connectionT *conn) {
             if (osc->format[0] == '\0') {
                 // no format string, means get
                 printf ("No format string - get\n");
-                h->getter(osc, conn);
+                if (h->getter) h->getter(osc, conn); else send_error_message(conn, "no getter");
             } else {
                 printf ("Has format string - set\n");
-                h->setter(osc, conn);
+                if (h->setter) h->setter(osc, conn); else send_error_message(conn, "no setter");
             }
             tosc_printMessage(osc);
             break;
@@ -117,6 +129,7 @@ void dispatch_message (tosc_message *osc, connectionT *conn) {
     }
 
     if (!h->address_match) {
+        send_error_message(conn, "invalid address");
         printf ("Failed to match\n");
         tosc_printMessage(osc);
     }
