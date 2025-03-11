@@ -21,6 +21,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <unistd.h>
+#include <ctype.h>
 
 #include <errno.h>
 
@@ -41,6 +42,8 @@ typedef struct {
     int  (*setter)(tosc_message *, connectionT *);
 } bioscc_handlerT;
 
+bool bioscc_bidirectional = 0;
+
 int info_get (tosc_message *m, connectionT *conn) {
   char buffer[2048];
   int len = 0;
@@ -55,8 +58,31 @@ int info_get (tosc_message *m, connectionT *conn) {
   return(0);
 }
 
+int bidirectional_set(tosc_message *message, connectionT *conn) {
+    char reply[] = "/ack";
+    bioscc_bidirectional = 1;
+printf ("SENDING REPLY\n");
+    conn->send(conn, reply, 5);
+
+    return(0);
+}
+
 bioscc_handlerT handlers[] = {
-    {"/info", info_get, NULL},
+    {"/ack", info_get, NULL},
+    {"/bidirectional", bidirectional_set, bidirectional_set},
+/*
+    {"/status", status_get, NULL},
+    {"/config/sends/[1-4]/source", config_send_source_get, config_send_source_set},
+    {"/config/sends/[1-4]/brightness", config_send_brightness_get, config_send_brightness_set},
+    {"/config/sends/[1-4]/contrast", config_send_contrast_get, config_send_contrast_set},
+    {"/config/sends/[1-4]/saturation", config_send_saturation_get, config_send_saturation_set},
+    {"/config/sends/[1-4]/hue", config_send_hue_get, config_send_hue_set},
+    {"/config/sends/[1-4]/zoom", config_send_zoom_get, config_send_zoom_set},
+    {"/config/send_format/resolution", config_send_format_resolution_get, config_send_format_resolution_set},
+    {"/config/send_format/framerate", config_send_format_framerate_get, config_send_format_framerate_set},
+    {"/config/send_format/colorspace", config_send_format_colorspace_get, config_send_format_colorspace_set},
+    {"/config/sync_lock", config_sync_lock_get, config_sync_lock_set},
+*/
     {NULL, NULL, NULL}
 };
 
@@ -76,6 +102,14 @@ void dispatch_message (tosc_message *osc, connectionT *conn) {
         // osc->buffer points to the address which is \0 terminated
         if (globmatch(osc->buffer, h->address_match)) {
             printf("Matched %s\n", h->address_match);
+            if (osc->format[0] == '\0') {
+                // no format string, means get
+                printf ("No format string - get\n");
+                h->getter(osc, conn);
+            } else {
+                printf ("Has format string - set\n");
+                h->setter(osc, conn);
+            }
             tosc_printMessage(osc);
             break;
         }
@@ -89,6 +123,14 @@ void dispatch_message (tosc_message *osc, connectionT *conn) {
 }
 
 size_t send_wrapper(connectionT *conn, const void *buf, size_t len) {
+    if (!bioscc_bidirectional) return(0);
+
+    int i;
+    char *buffer = (char *) buf;
+    printf ("SENDING: ");
+    for (i=0; i<len; i++) if (isprint(buffer[i])) printf ("%c", buffer[i]); else  printf ("(%02X)", buffer[i]);
+    printf ("\n");
+
     conn->sa_len = sizeof(conn->sa);
     return(sendto(conn->fd, buf, len, 0, &conn->sa, conn->sa_len));
 }
@@ -136,11 +178,6 @@ int main(int argc, char *argv[]) {
           tosc_message osc;
           tosc_parseMessage(&osc, buffer, len);
           dispatch_message(&osc, &conn);
-        }
-        errno = 0;
-        len = conn.send(&conn, "Reply!", 7);
-        if (len < 0) {
-            perror ("reply failed :(");
         }
       }
     }
