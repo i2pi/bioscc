@@ -52,6 +52,14 @@ typedef struct {
 
 bool bioscc_bidirectional = 1;
 
+void send_error_message(connectionT *conn, char *text) {
+    char buffer[128];
+    int len;
+
+    len = tosc_writeMessage(buffer, sizeof(buffer), "/error", "s", text);
+    conn->send(conn, buffer, len);
+}
+
 int ack(tosc_message *message, connectionT *conn) {
     char reply[] = "/ack";
     conn->send(conn, reply, 5);
@@ -80,14 +88,14 @@ int message_to_send_number(tosc_message *m, connectionT *conn) {
     //  0123456
     int d = m->buffer[6] - '1';
     if ((d < 0) || (d > 3)) {
-        send_error(conn, "invalid send number");
+        send_error_message(conn, "invalid send number");
         return (-1);
     }
     return(d);
 }
 
 int config_send_source_get(tosc_message *message, connectionT *conn) {
-    int send = message_to_send_number(message);
+    int send = message_to_send_number(message, conn);
     if (send < 0) return (-1);
 
     printf ("Send %d -> Source GET\n", send);
@@ -95,12 +103,12 @@ int config_send_source_get(tosc_message *message, connectionT *conn) {
 }
 
 int config_send_source_set(tosc_message *message, connectionT *conn) {
-    int send = message_to_send_number(message);
+    int send = message_to_send_number(message, conn);
     if (send < 0) return (-1);
     int source = tosc_getNextInt32(message);
 
     if ((source < 0) || (source > 3)) {
-        send_error(conn, "invalid source number");
+        send_error_message(conn, "invalid source number");
         return(-1);
     }
 
@@ -109,18 +117,18 @@ int config_send_source_set(tosc_message *message, connectionT *conn) {
 }
 
 int config_send_brightness_get(tosc_message *message, connectionT *conn) {
-    int send = message_to_send_number(message);
+    int send = message_to_send_number(message, conn);
     if (send < 0) return (-1);
 
-    printf ("Send %d -> GET Brightness\n");
+    printf ("Send %d -> GET Brightness\n", send);
     return (0);
 }
 
 int config_send_brightness_set(tosc_message *message, connectionT *conn) {
-    int send = message_to_send_number(message);
+    int send = message_to_send_number(message, conn);
     if (send < 0) return (-1);
 
-    printf ("Send %d -> GET Brightness\n");
+    printf ("Send %d -> GET Brightness\n", send);
     return (0);
 }
 
@@ -151,14 +159,6 @@ static volatile bool keepRunning = true;
 // handle Ctrl+C
 static void sigintHandler(int x) {
   keepRunning = false;
-}
-
-void send_error_message(connectionT *conn, char *text) {
-    char buffer[128];
-    int len;
-
-    len = tosc_writeMessage(buffer, sizeof(buffer), "/error", "s", text);
-    conn->send(conn, buffer, len);
 }
 
 void dispatch_message (tosc_message *osc, connectionT *conn) {
