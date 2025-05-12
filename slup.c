@@ -48,10 +48,6 @@ static void print_bytes(const uint8_t *buf, size_t len) {
     putchar('\n');
 }
 
-static double diff_ms(const struct timespec *a, const struct timespec *b) {
-    return (b->tv_sec - a->tv_sec) * 1000.0
-         + (b->tv_nsec - a->tv_nsec) / 1e6;
-}
 
 static void process_serial_to_udp(struct sp_port *serial,
                                   int udp_fd,
@@ -99,16 +95,12 @@ static void process_udp_to_serial(int udp_fd,
                                   struct sockaddr_storage *peer_addr,
                                   socklen_t *peer_len)
 {
-    struct timespec t0, t1, t2, t3;
-    clock_gettime(CLOCK_MONOTONIC, &t0);
-
     uint8_t buf[MAX_PACKET_SIZE];
     struct sockaddr_storage src;
     socklen_t src_len = sizeof(src);
 
     ssize_t len = recvfrom(udp_fd, buf, sizeof(buf), 0,
                            (struct sockaddr*)&src, &src_len);
-    clock_gettime(CLOCK_MONOTONIC, &t1);
     if (len <= 0) return;
 
     memcpy(peer_addr, &src, src_len);
@@ -125,25 +117,16 @@ static void process_udp_to_serial(int udp_fd,
         return;
     }
     cobs_buf[eres.out_len++] = 0x00;
-    clock_gettime(CLOCK_MONOTONIC, &t2);
 
     printf("→ SER (raw): ");
     print_bytes(cobs_buf, eres.out_len);
 
     ssize_t written = sp_blocking_write(serial, cobs_buf, eres.out_len, 100);
-    clock_gettime(CLOCK_MONOTONIC, &t3);
     if (written < 0) {
         char *msg = sp_last_error_message();
         fprintf(stderr, "serial write error: %s\n", msg);
         sp_free_error_message(msg);
     }
-
-    fprintf(stderr,
-            "timing: recv=%.2fms encode=%.2fms write=%.2fms bytes=%zu\n",
-            diff_ms(&t0, &t1),
-            diff_ms(&t1, &t2),
-            diff_ms(&t2, &t3),
-            (size_t)eres.out_len);
 }
 
 int main(int argc, char *argv[])
