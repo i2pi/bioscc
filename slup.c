@@ -1,216 +1,209 @@
 #include <arpa/inet.h>
-#include <sys/select.h>
+#include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <libserialport.h>
 #include <signal.h>
 #include <stdbool.h>
 #include <stdio.h>
-#include <unistd.h>
-#include <ctype.h>
-
-#include <string.h>
 #include <stdlib.h>
-
-#include <errno.h>
-
-#include <libserialport.h>
+#include <string.h>
+#include <sys/select.h>
+#include <unistd.h>
 
 #include "cobs.h"
 
+#define UDP_PORT           9000
+#define SERIAL_BAUDRATE    115200
+#define SERIAL_TIMEOUT_MS  500    // for blocking read timeout
+#define MAX_PACKET_SIZE    2048
+#define COBS_BUFFER_SIZE   8192
 
-typedef struct {
-    int fd;
-    struct sockaddr sa; 
-    socklen_t sa_len;
-} conT;
+static volatile bool keep_running = true;
 
-typedef struct connectionT {
-    conT   send_con;
-    conT   receive_con;
-    size_t (*send)(struct connectionT *, const void *, size_t);
-    size_t (*receive)(struct connectionT *, const void *, size_t);
-} connectionT;
-
-static volatile bool keepRunning = true;
-
-// handle Ctrl+C
-static void sigintHandler(int x) {
-  keepRunning = false;
+static void handle_sigint(int sig) {
+    (void)sig;
+    keep_running = false;
 }
 
-void print_bytes(const unsigned char *buffer, size_t len) {
-    int i;
-    for (i=0; i<len; i++) if (isprint(buffer[i])) printf ("%c", buffer[i]); else  printf ("(%02X)", buffer[i]);
-}
-
-size_t send_wrapper(connectionT *conn, const void *buf, size_t len) {
-    int i;
-    printf ("--> UDP: "); print_bytes(buf, len); printf ("\n");
-
-    conn->send_con.sa_len = sizeof(conn->send_con.sa);
-
-    errno = 0;
-    i =  sendto(conn->send_con.fd, buf, len, 0, NULL, sizeof(conn->send_con.sa));
-    if (errno) {
-        perror("sending");
+static void print_bytes(const uint8_t *buf, size_t len) {
+    for (size_t i = 0; i < len; i++) {
+        if (isprint(buf[i])) putchar(buf[i]);
+        else                 printf("(%02X)", buf[i]);
     }
-
-    return (i);
+    putchar('\n');
 }
 
-
-/* Helper function for error handling. */
-int check(enum sp_return result)
-{
-        /* For this example we'll just exit on any error by calling abort(). */
-        char *error_message;
-        switch (result) {
-        case SP_ERR_ARG:
-                printf("Error: Invalid argument.\n");
-                abort();
-        case SP_ERR_FAIL:
-                error_message = sp_last_error_message();
-                printf("Error: Failed: %s\n", error_message);
-                sp_free_error_message(error_message);
-                abort();
-        case SP_ERR_SUPP:
-                printf("Error: Not supported.\n");
-                abort();
-        case SP_ERR_MEM:
-                printf("Error: Couldn't allocate memory.\n");
-                abort();
-        case SP_OK:
-        default:
-                return result;
-        }
+static void die_perror(const char *msg) {
+    perror(msg);
+    exit(EXIT_FAILURE);
 }
 
-void list_serial_ports(void)
-{
-        /* A pointer to a null-terminated array of pointers to
-         * struct sp_port, which will contain the ports found.*/
-        struct sp_port **port_list;
-
-        /* Call sp_list_ports() to get the ports. The port_list
-         * pointer will be updated to refer to the array created. */
-        enum sp_return result = sp_list_ports(&port_list);
-        if (result != SP_OK) {
-                printf("sp_list_ports() failed!\n");
-                return;
-        }
-        /* Iterate through the ports. When port_list[i] is NULL
-         * this indicates the end of the list. */
-        int i;
-        for (i = 0; port_list[i] != NULL; i++) {
-                struct sp_port *port = port_list[i];
-                /* Get the name of the port. */
-                char *port_name = sp_get_port_name(port);
-                printf("Found port: %s\n", port_name);
-        }
-        /* Free the array created by sp_list_ports(). */
-        sp_free_port_list(port_list);
-        /* Note that this will also free all the sp_port structures
-         * it points to. If you want to keep one of them (e.g. to
-         * use that port in the rest of your program), take a copy
-         * of it first using sp_copy_port(). */
+static void exit_on_sp_error(enum sp_return r) {
+    if (r == SP_OK)
         return;
+    char *err = sp_last_error_message();
+    fprintf(stderr, "Serial error: %s\n", err);
+    sp_free_error_message(err);
+    exit(EXIT_FAILURE);
 }
 
-void process_serial_input(struct sp_port *serial_port, connectionT *conn) {
-    unsigned char buffer[8192];
+static void list_serial_ports(void) {
+    struct sp_port **ports;
+    if (sp_list_ports(&ports) != SP_OK) {
+        fprintf(stderr, "sp_list_ports() failed\n");
+        return;
+    }
+    for (int i = 0; ports[i]; i++) {
+        printf("  %s\n", sp_get_port_name(ports[i]));
+    }
+    sp_free_port_list(ports);
+}
 
-    if (sp_input_waiting(serial_port) > 0) {
-        unsigned char out_buffer[8192];
+// Read one COBS-framed packet (ending in 0x00) from serial, decode it,
+// then send the decoded data back over UDP to the last peer.
+static void process_serial_to_udp(struct sp_port *serial,
+                                  int udp_fd,
+                                  struct sockaddr_storage *peer_addr,
+                                  socklen_t peer_len)
+{
+    uint8_t in_buf[COBS_BUFFER_SIZE];
+    ssize_t r = sp_blocking_read(serial, in_buf, sizeof(in_buf), SERIAL_TIMEOUT_MS);
+    if (r <= 0) return;  // timeout or error
 
-        int len = check(sp_blocking_read(serial_port, buffer, 8191, 500));        
+    // Expect trailing 0x00
+    if (in_buf[r-1] != 0) {
+        fprintf(stderr, "Warning: serial frame missing terminator\n");
+        return;
+    }
+    size_t framed_len = (size_t)r - 1;
 
-        printf ("Ser -->: "); print_bytes(buffer, len); printf ("\n");
-        len--; // trailing 0x00
+    printf("SER → UDP  : ");
+    print_bytes(in_buf, r);
 
-        cobs_decode_result res = cobs_decode(out_buffer, 8191, buffer, len);
-        if (res.status != COBS_DECODE_OK) {
-            fprintf(stderr, "Failed to cobs decode serial input [%d]\n", res.status);
-        }
-        send_wrapper(conn, out_buffer, res.out_len);
+    uint8_t out_buf[COBS_BUFFER_SIZE];
+    cobs_decode_result dres = cobs_decode(out_buf, sizeof(out_buf), in_buf, framed_len);
+    if (dres.status != COBS_DECODE_OK) {
+        fprintf(stderr, "COBS decode failed (%d)\n", dres.status);
+        return;
+    }
+
+    if (peer_len == 0) {
+        fprintf(stderr, "No UDP peer to reply to yet\n");
+        return;
+    }
+
+    printf("→ UDP (raw): ");
+    print_bytes(out_buf, dres.out_len);
+
+    ssize_t sent = sendto(udp_fd, out_buf, dres.out_len, 0,
+                          (struct sockaddr*)peer_addr, peer_len);
+    if (sent < 0) perror("sendto");
+}
+
+// Read one UDP datagram, COBS-encode it, and write to serial.
+static void process_udp_to_serial(int udp_fd, struct sp_port *serial,
+                                  struct sockaddr_storage *peer_addr,
+                                  socklen_t *peer_len)
+{
+    uint8_t buf[MAX_PACKET_SIZE];
+    struct sockaddr_storage src;
+    socklen_t src_len = sizeof(src);
+
+    ssize_t len = recvfrom(udp_fd, buf, sizeof(buf), 0,
+                           (struct sockaddr*)&src, &src_len);
+    if (len <= 0) return;
+
+    // Remember who sent it for replies
+    memcpy(peer_addr, &src, src_len);
+    *peer_len = src_len;
+
+    printf("UDP → SER  : ");
+    print_bytes(buf, len);
+
+    uint8_t cobs_buf[COBS_BUFFER_SIZE];
+    cobs_encode_result eres = cobs_encode(cobs_buf, sizeof(cobs_buf)-1, buf, (size_t)len);
+    if (eres.status != COBS_ENCODE_OK) {
+        fprintf(stderr, "COBS encode failed (%d)\n", eres.status);
+        return;
+    }
+    // append terminator
+    cobs_buf[eres.out_len++] = 0x00;
+
+    printf("→ SER (raw): ");
+    print_bytes(cobs_buf, eres.out_len);
+
+    ssize_t written = sp_blocking_write(serial, cobs_buf, eres.out_len, 1000);
+    if (written < 0) {
+        char *msg = sp_last_error_message();
+        fprintf(stderr, "serial write error: %s\n", msg);
+        sp_free_error_message(msg);
     }
 }
 
-int main(int argc, char *argv[]) {
-    unsigned char buffer[2048];
-    connectionT conn;
-    struct sp_port *serial_port;
-
+int main(int argc, char *argv[])
+{
     if (argc != 2) {
-        fprintf (stderr, "Usage: %s <serial port>\n", argv[0]);
+        fprintf(stderr, "Usage: %s <serial-port-name>\n", argv[0]);
+        printf("Available ports:\n");
         list_serial_ports();
-        exit (-1);
+        return EXIT_FAILURE;
     }
 
-    check(sp_get_port_by_name(argv[1], &serial_port));
+    // set up Ctrl-C handler
+    signal(SIGINT, handle_sigint);
 
-    check(sp_open(serial_port, SP_MODE_READ_WRITE));
-    printf ("Setting port to 115200 8N1\n");
-    check(sp_set_baudrate(serial_port, 115200));
-    check(sp_set_bits(serial_port, 8));
-    check(sp_set_parity(serial_port, SP_PARITY_NONE));
-    check(sp_set_stopbits(serial_port, 1));
-    check(sp_set_flowcontrol(serial_port, SP_FLOWCONTROL_NONE));
-      
-    conn.send = send_wrapper;
+    // open and configure serial port
+    struct sp_port *serial;
+    exit_on_sp_error(sp_get_port_by_name(argv[1], &serial));
+    exit_on_sp_error(sp_open(serial, SP_MODE_READ_WRITE));
+    printf("Opened %s at %d-8-N-1\n", argv[1], SERIAL_BAUDRATE);
+    exit_on_sp_error(sp_set_baudrate(serial, SERIAL_BAUDRATE));
+    exit_on_sp_error(sp_set_bits(serial, 8));
+    exit_on_sp_error(sp_set_parity(serial, SP_PARITY_NONE));
+    exit_on_sp_error(sp_set_stopbits(serial, 1));
+    exit_on_sp_error(sp_set_flowcontrol(serial, SP_FLOWCONTROL_NONE));
 
-    // register the SIGINT handler (Ctrl+C)
-    signal(SIGINT, &sigintHandler);
-    
-    // open a socket to listen for datagrams (i.e. UDP packets) on port 9000
-    conn.receive_con.fd = socket(AF_INET, SOCK_DGRAM, 0);
-    fcntl(conn.receive_con.fd, F_SETFL, O_NONBLOCK); // set the socket to non-blocking
+    // open non-blocking UDP socket
+    int udp_fd = socket(AF_INET, SOCK_DGRAM, 0);
+    if (udp_fd < 0) die_perror("socket");
+    fcntl(udp_fd, F_SETFL, O_NONBLOCK);
 
-    struct sockaddr_in sin;
+    struct sockaddr_in local = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(UDP_PORT),
+        .sin_addr.s_addr = INADDR_ANY
+    };
+    if (bind(udp_fd, (struct sockaddr*)&local, sizeof(local)) < 0)
+        die_perror("bind");
 
-    sin.sin_family = AF_INET;
-    sin.sin_port = htons(9000);
-    sin.sin_addr.s_addr = INADDR_ANY;
-    bind(conn.receive_con.fd, (struct sockaddr *) &sin, sizeof(struct sockaddr_in));
+    printf("Listening on UDP port %d\n", UDP_PORT);
 
-    // open a socket to send
-    conn.send_con.fd = socket(AF_INET, SOCK_DGRAM, 0);
-    fcntl(conn.send_con.fd, F_SETFL, O_NONBLOCK); // set the socket to non-blocking
+    // track last UDP peer for replies
+    struct sockaddr_storage peer_addr = {0};
+    socklen_t peer_len = 0;
 
-    sin.sin_port = htons(9010);
-    connect(conn.send_con.fd, (struct sockaddr *) &sin, sizeof(struct sockaddr_in));
+    // main loop
+    while (keep_running) {
+        // first handle any incoming serial → UDP
+        process_serial_to_udp(serial, udp_fd, &peer_addr, peer_len);
 
-    printf("Press Ctrl+C to stop.\n");
-
-    while (keepRunning) {
-      fd_set readSet;
-      FD_ZERO(&readSet);
-      FD_SET(conn.receive_con.fd, &readSet);
-      struct timeval timeout = {0, 5000}; 
-
-        process_serial_input(serial_port, &conn);
-
-      if (select(conn.receive_con.fd+1, &readSet, NULL, NULL, &timeout) > 0) {
-        int len = 0;
-        while ((len = (int) recvfrom(conn.receive_con.fd, buffer, sizeof(buffer), 0, &conn.receive_con.sa, &conn.receive_con.sa_len)) > 0) {
-            unsigned char cobs_buffer[8192];
-            cobs_encode_result res;
-
-            printf ("UDP -->: "); print_bytes(buffer, len); printf ("\n");
-
-            res = cobs_encode(cobs_buffer, 8191, buffer, len);
-            if (res.status == COBS_ENCODE_OK) {
-                cobs_buffer[res.out_len++] = '\0';
-
-                printf ("--> Ser: "); print_bytes(cobs_buffer, res.out_len); printf ("\n");
-                check(sp_blocking_write(serial_port, cobs_buffer, res.out_len, 1000));
-            } else {
-                printf ("COBS encode error!\n");
-            }
+        // then wait briefly for UDP → serial
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(udp_fd, &rfds);
+        struct timeval tv = { 0, 5000 };  // 5 ms
+        if (select(udp_fd+1, &rfds, NULL, NULL, &tv) > 0) {
+            if (FD_ISSET(udp_fd, &rfds))
+                process_udp_to_serial(udp_fd, serial, &peer_addr, &peer_len);
         }
-      }
     }
 
-    close(conn.receive_con.fd);
-    close(conn.send_con.fd);
-
+    // clean up
+    close(udp_fd);
+    sp_close(serial);
+    sp_free_port(serial);
+    printf("Terminated cleanly\n");
     return 0;
 }
+
