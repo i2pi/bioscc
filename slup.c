@@ -48,44 +48,60 @@ static void print_bytes(const uint8_t *buf, size_t len) {
     putchar('\n');
 }
 
-
 static void process_serial_to_udp(struct sp_port *serial,
                                   int udp_fd,
                                   struct sockaddr_storage *peer_addr,
                                   socklen_t peer_len)
 {
-    uint8_t in_buf[COBS_BUFFER_SIZE];
+    static uint8_t rx_buf[COBS_BUFFER_SIZE];
+    static size_t rx_len = 0;
+    uint8_t temp[COBS_BUFFER_SIZE];
+
     ssize_t r;
-    while ((r = sp_nonblocking_read(serial, in_buf, sizeof(in_buf))) > 0) {
-        if (in_buf[r - 1] != 0) {
-            fprintf(stderr, "Warning: serial frame missing terminator\n");
+    while ((r = sp_nonblocking_read(serial, temp, sizeof(temp))) > 0) {
+        // Append incoming bytes to rolling buffer
+        if ((size_t)r + rx_len > sizeof(rx_buf)) {
+            fprintf(stderr, "Warning: rx buffer overflow, clearing\n");
+            rx_len = 0;
             continue;
         }
-        size_t framed_len = (size_t)r - 1;
+        memcpy(rx_buf + rx_len, temp, r);
+        rx_len += r;
 
-        printf("SER → UDP  : ");
-        print_bytes(in_buf, r);
+        // Extract and process complete COBS frames
+        size_t offset = 0;
+        while (offset < rx_len) {
+            uint8_t *term = memchr(rx_buf + offset, 0x00, rx_len - offset);
+            if (!term) break;
+            size_t frame_len = term - (rx_buf + offset);
 
-        uint8_t out_buf[COBS_BUFFER_SIZE];
-        cobs_decode_result dres =
-            cobs_decode(out_buf, sizeof(out_buf), in_buf, framed_len);
-        if (dres.status != COBS_DECODE_OK) {
-            fprintf(stderr, "COBS decode error %d\n", dres.status);
-            continue;
+            uint8_t out_buf[COBS_BUFFER_SIZE];
+            cobs_decode_result dres = cobs_decode(out_buf, sizeof(out_buf), rx_buf + offset, frame_len);
+            if (dres.status == COBS_DECODE_OK) {
+                if (peer_len == 0) {
+                    fprintf(stderr, "No UDP peer set\n");
+                } else {
+                    printf("SER → UDP  : ");
+                    print_bytes(rx_buf + offset, frame_len + 1);
+                    printf("→ UDP (raw): ");
+                    print_bytes(out_buf, dres.out_len);
+                    if (sendto(udp_fd, out_buf, dres.out_len, 0,
+                               (struct sockaddr*)peer_addr, peer_len) < 0)
+                    {
+                        perror("sendto");
+                    }
+                }
+            } else {
+                fprintf(stderr, "COBS decode error %d on frame of length %zu\n", dres.status, frame_len);
+            }
+
+            offset += frame_len + 1;
         }
 
-        if (peer_len == 0) {
-            fprintf(stderr, "No UDP peer set\n");
-            continue;
-        }
-
-        printf("→ UDP (raw): ");
-        print_bytes(out_buf, dres.out_len);
-
-        if (sendto(udp_fd, out_buf, dres.out_len, 0,
-                   (struct sockaddr*)peer_addr, peer_len) < 0)
-        {
-            perror("sendto");
+        // Shift leftover bytes to start of buffer
+        if (offset > 0) {
+            memmove(rx_buf, rx_buf + offset, rx_len - offset);
+            rx_len -= offset;
         }
     }
 }
@@ -131,6 +147,20 @@ static void process_udp_to_serial(int udp_fd,
 
 int main(int argc, char *argv[])
 {
+    if (argc < 2) {
+        struct sp_port **ports;
+        if (sp_list_ports(&ports) == SP_OK) {
+            printf("Available serial ports:\n");
+            for (struct sp_port **p = ports; *p; ++p) {
+                printf("  %s\n", sp_get_port_name(*p));
+            }
+            sp_free_port_list(ports);
+        } else {
+            fprintf(stderr, "Error listing serial ports\n");
+        }
+        return EXIT_SUCCESS;
+    }
+
     if (argc != 2) {
         fprintf(stderr, "Usage: %s <serial-port>\n", argv[0]);
         return EXIT_FAILURE;
